@@ -1,0 +1,4 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+pydantic[email]>=2.6,<3
+qrcode[pil]>=7.4,<9

@@ -16,13 +16,28 @@ def survey_payload(suffix="01", goal="Muốn giảm cân eo thon", parq=None):
     return {"full_name":"Nguyễn Minh Anh", "phone":f"09012345{suffix}", "email":f"member{suffix}@example.com",
             "raw_goal_text":goal, "parq_answers":parq or [False]*7, "coaching_style":"MOTIVATIONAL"}
 
+def login_as(client, username, password):
+    response=client.post("/api/auth/login",json={"username":username,"password":password})
+    assert response.status_code==200, response.text
+
 def make_contract(client, suffix="01"):
-    survey=client.post("/api/survey/submit",json=survey_payload(suffix)).json()
+    survey_response=client.post("/api/survey/submit",json=survey_payload(suffix))
+    assert survey_response.status_code==200, survey_response.text
+    survey=survey_response.json()
     assert survey["status"]=="AUTO_ACCEPTED"
-    trainer=survey["trainers"][0]
-    contract=client.post("/api/contracts/generate",json={"survey_id":survey["survey_id"],"trainer_id":trainer["trainer_id"],"package_name":"CLASSIC","months":3})
-    assert contract.status_code==200, contract.text
-    return contract.json()
+    choice=client.post("/api/packages/select",json={"survey_id":survey["survey_id"],"package_name":"CLASSIC","months":3})
+    assert choice.status_code==200 and choice.json()["next_task"]=="TS", choice.text
+    match=client.post("/api/matching/find-trainers",json={"survey_id":survey["survey_id"]})
+    assert match.status_code==200 and match.json()["matched_trainers"], match.text
+    trainer=match.json()["matched_trainers"][0]
+    slot=trainer["available_slots"][0]
+    held=client.post("/api/slots/hold",json={"survey_id":survey["survey_id"],"trainer_id":trainer["trainer_id"],"slot_id":slot["slot_id"]})
+    assert held.status_code==200, held.text
+    login_as(client,"pt","Trainer@123")
+    accepted=client.post("/api/pt/respond-schedule",json={"survey_id":survey["survey_id"],"accepted":True,"note":"Lịch buổi đầu đã xác nhận"})
+    assert accepted.status_code==200, accepted.text
+    login_as(client,"customer","Member@123")
+    return accepted.json()["contract"]
 
 def signed_contract(client, suffix="01"):
     contract=make_contract(client,suffix)
@@ -65,16 +80,18 @@ def test_tc03_invalid_data_and_medical_alert(client):
     assert response.status_code==200
     assert response.json()["medical_alert"] is True
 
-def test_tc04_failed_payment_keeps_draft_and_retry_link(client):
+def test_tc04_failed_payment_preserves_signed_contract_and_allows_retry(client):
     contract=signed_contract(client,"05")
     response=client.post("/api/payments/checkout",json={"contract_id":contract["contract_id"],"payment_method":"MOMO","simulate_failure":True})
-    assert response.json()["status"]=="FAILED"
-    assert response.json()["retry_link"]
+    assert response.json()["status"]=="PENDING"
+    failed=client.post("/api/payments/webhook-verify",json={"transaction_ref":response.json()["transaction_ref"],"success":False})
+    assert failed.json()["status"]=="FAILED"
+    assert failed.json()["retry_link"]
     current=client.get(f"/api/contracts/{contract['contract_id']}").json()
-    assert current["status"]=="DRAFT"
-    released=client.post(f"/api/slots/release-failed-payment?contract_id={contract['contract_id']}")
-    assert released.status_code==200
-    assert client.get(f"/api/contracts/{contract['contract_id']}").json()["status"]=="CANCELLED"
+    assert current["status"]=="SIGNED"
+    retry=client.post("/api/payments/checkout",json={"contract_id":contract["contract_id"],"payment_method":"MOMO"})
+    paid=client.post("/api/payments/webhook-verify",json={"transaction_ref":retry.json()["transaction_ref"],"success":True})
+    assert paid.json()["status"]=="SUCCESS"
 
 def test_tc05_checkout_idempotency_by_transaction_reference(client):
     contract=signed_contract(client,"06")
